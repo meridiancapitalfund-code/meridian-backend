@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-MERIDIAN — Backend Trade Republic (v2, lecture de portefeuille renforcée)
-À héberger par vous.
+MERIDIAN — Backend Trade Republic (v3)
+Correctif majeur : une SEULE boucle asyncio persistante pour toute la
+communication Trade Republic (login + websocket), ce qui élimine
+l'erreur "Future attached to a different loop".
+
   pip install pytr flask flask-cors
-  python meridian_tr_server.py        (local)
   gunicorn -w 1 --threads 4 --timeout 120 -b 0.0.0.0:$PORT meridian_tr_server:app
 """
 
@@ -14,7 +16,7 @@ try:
     from flask import Flask, request, jsonify
     from flask_cors import CORS
 except ImportError:
-    raise SystemExit("Manque Flask. Lancez :  pip install flask flask-cors")
+    raise SystemExit("Manque Flask. Lancez : pip install flask flask-cors")
 
 try:
     try:
@@ -22,10 +24,30 @@ try:
     except ImportError:
         from py_tr import TradeRepublicApi
 except ImportError:
-    raise SystemExit("Manque pytr. Lancez :  pip install pytr")
+    raise SystemExit("Manque pytr. Lancez : pip install pytr")
 
 app = Flask(__name__)
 CORS(app)
+
+# ---- UNE boucle asyncio persistante, partagée par tout le service ----
+_LOOP = asyncio.new_event_loop()
+def _loop_runner():
+    asyncio.set_event_loop(_LOOP)
+    _LOOP.run_forever()
+threading.Thread(target=_loop_runner, daemon=True).start()
+
+def _await(coro, timeout=45):
+    return asyncio.run_coroutine_threadsafe(coro, _LOOP).result(timeout=timeout)
+
+def _maybe(x):
+    return _await(x) if inspect.iscoroutine(x) else x
+
+def _new_api(phone, pin, locale):
+    # Construit l'objet pytr SUR la boucle partagée (ses primitives asyncio
+    # se lient ainsi à _LOOP, pas au thread Flask).
+    async def mk():
+        return TradeRepublicApi(phone_no=phone, pin=pin, locale=locale)
+    return _await(mk())
 
 SESSIONS = {}
 SESSION_TTL = 60 * 30
@@ -42,14 +64,6 @@ def _gc():
             SESSIONS.pop(k, None)
 
 
-def _maybe(x):
-    if inspect.iscoroutine(x):
-        loop = asyncio.new_event_loop()
-        try: return loop.run_until_complete(x)
-        finally: loop.close()
-    return x
-
-
 def _method(tr, names):
     for n in names:
         m = getattr(tr, n, None)
@@ -58,22 +72,28 @@ def _method(tr, names):
     raise AttributeError("pytr: aucune methode parmi %s" % names)
 
 
+async def _topic_coro(tr, m, args):
+    sid = await m(*args)
+    resp = None
+    try:
+        for _ in range(120):
+            r_sid, _sub, r = await tr.recv()
+            if r_sid == sid:
+                resp = r
+                break
+    finally:
+        try:
+            u = getattr(tr, "unsubscribe", None)
+            if u is not None:
+                await u(sid)
+        except Exception:
+            pass
+    return resp
+
+
 def _topic(tr, names, *args):
     m = _method(tr, names)
-    coro = m(*args)
-    rb = getattr(tr, "run_blocking", None)
-    if rb is not None:
-        return rb(coro, timeout=10.0)
-    async def _run():
-        sid = await coro
-        for _ in range(80):
-            r_sid, _sub, resp = await tr.recv()
-            if r_sid == sid:
-                return resp
-        return None
-    loop = asyncio.new_event_loop()
-    try: return loop.run_until_complete(_run())
-    finally: loop.close()
+    return _await(_topic_coro(tr, m, args))
 
 
 def _num(*vals):
@@ -175,7 +195,7 @@ def login_start():
     if not phone or not pin:
         return jsonify(error="Numero et PIN requis"), 400
     try:
-        tr = TradeRepublicApi(phone_no=phone, pin=pin, locale=d.get("locale", "fr"))
+        tr = _new_api(phone, pin, d.get("locale", "fr"))
         _maybe(_method(tr, ["inititate_weblogin", "initiate_weblogin"])())
     except Exception as e:
         return jsonify(error="Connexion refusee : %s" % e), 401
@@ -235,9 +255,9 @@ def logout():
 
 @app.get("/")
 def health():
-    return jsonify(service="meridian-tr", status="ok", version=2, sessions=len(SESSIONS))
+    return jsonify(service="meridian-tr", status="ok", version=3, sessions=len(SESSIONS))
 
 
 if __name__ == "__main__":
-    print("Meridian — backend Trade Republic (v2) sur http://localhost:8765")
+    print("Meridian — backend Trade Republic (v3) sur http://localhost:8765")
     app.run(host="0.0.0.0", port=8765, threaded=True)
