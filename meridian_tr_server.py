@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-MERIDIAN — Backend Trade Republic (v3)
-Correctif majeur : une SEULE boucle asyncio persistante pour toute la
-communication Trade Republic (login + websocket), ce qui élimine
-l'erreur "Future attached to a different loop".
+MERIDIAN — Backend Trade Republic (v4)
+- Login : géré nativement par pytr (comme la version qui fonctionnait).
+- Données : UNE boucle asyncio dédiée PAR SESSION, réutilisée pour tous les
+  appels websocket de cette session -> plus d'erreur "different loop".
 
   pip install pytr flask flask-cors
   gunicorn -w 1 --threads 4 --timeout 120 -b 0.0.0.0:$PORT meridian_tr_server:app
@@ -29,29 +29,9 @@ except ImportError:
 app = Flask(__name__)
 CORS(app)
 
-# ---- UNE boucle asyncio persistante, partagée par tout le service ----
-_LOOP = asyncio.new_event_loop()
-def _loop_runner():
-    asyncio.set_event_loop(_LOOP)
-    _LOOP.run_forever()
-threading.Thread(target=_loop_runner, daemon=True).start()
-
-def _await(coro, timeout=45):
-    return asyncio.run_coroutine_threadsafe(coro, _LOOP).result(timeout=timeout)
-
-def _maybe(x):
-    return _await(x) if inspect.iscoroutine(x) else x
-
-def _new_api(phone, pin, locale):
-    # Construit l'objet pytr SUR la boucle partagée (ses primitives asyncio
-    # se lient ainsi à _LOOP, pas au thread Flask).
-    async def mk():
-        return TradeRepublicApi(phone_no=phone, pin=pin, locale=locale)
-    return _await(mk())
-
 SESSIONS = {}
 SESSION_TTL = 60 * 30
-_lock = threading.Lock()
+_glock = threading.Lock()
 
 TYPE_TO_CLS = {"stock": "Actions", "fund": "ETF", "etf": "ETF", "crypto": "Crypto",
                "bond": "Obligations", "derivative": "Actions", "warrant": "Actions"}
@@ -59,7 +39,7 @@ TYPE_TO_CLS = {"stock": "Actions", "fund": "ETF", "etf": "ETF", "crypto": "Crypt
 
 def _gc():
     now = time.time()
-    with _lock:
+    with _glock:
         for k in [k for k, v in SESSIONS.items() if v["exp"] < now]:
             SESSIONS.pop(k, None)
 
@@ -70,6 +50,20 @@ def _method(tr, names):
         if m is not None:
             return m
     raise AttributeError("pytr: aucune methode parmi %s" % names)
+
+
+def _run_on(s, coro):
+    """Exécute une coroutine sur la boucle DÉDIÉE de la session (sérialisé)."""
+    loop = s.get("loop")
+    if loop is None or loop.is_closed():
+        loop = asyncio.new_event_loop()
+        s["loop"] = loop
+    with s["lock"]:
+        return loop.run_until_complete(coro)
+
+
+def _maybe(s, x):
+    return _run_on(s, x) if inspect.iscoroutine(x) else x
 
 
 async def _topic_coro(tr, m, args):
@@ -91,9 +85,9 @@ async def _topic_coro(tr, m, args):
     return resp
 
 
-def _topic(tr, names, *args):
-    m = _method(tr, names)
-    return _await(_topic_coro(tr, m, args))
+def _topic(s, names, *args):
+    m = _method(s["tr"], names)
+    return _run_on(s, _topic_coro(s["tr"], m, args))
 
 
 def _num(*vals):
@@ -124,12 +118,12 @@ def _positions_from(pf):
     return []
 
 
-def fetch_portfolio(tr):
+def fetch_portfolio(s):
     dbg = {}
     positions = []
     for name in ("compact_portfolio", "portfolio"):
         try:
-            pf = _topic(tr, [name])
+            pf = _topic(s, [name])
         except Exception as e:
             dbg[name + "_err"] = str(e)
             continue
@@ -141,7 +135,7 @@ def fetch_portfolio(tr):
 
     cash = 0.0
     try:
-        c = _topic(tr, ["cash"])
+        c = _topic(s, ["cash"])
         if isinstance(c, list):
             for x in c:
                 cash += _num(x.get("amount"))
@@ -160,15 +154,15 @@ def fetch_portfolio(tr):
         price, name, typ = buy, (isin or "Position"), "stock"
         if isin:
             try:
-                try: tick = _topic(tr, ["ticker"], isin, "LSX")
-                except TypeError: tick = _topic(tr, ["ticker"], isin)
+                try: tick = _topic(s, ["ticker"], isin, "LSX")
+                except TypeError: tick = _topic(s, ["ticker"], isin)
                 if isinstance(tick, dict):
                     last = tick.get("last") or {}
                     price = _num(last.get("price"), (tick.get("bid") or {}).get("price")) or price
             except Exception:
                 pass
             try:
-                ins = _topic(tr, ["instrument_details", "instrument"], isin)
+                ins = _topic(s, ["instrument_details", "instrument"], isin)
                 if isinstance(ins, dict):
                     name = ins.get("shortName") or ins.get("name") or isin
                     typ = ins.get("typeId") or ins.get("type") or "stock"
@@ -194,14 +188,15 @@ def login_start():
     phone, pin = (d.get("phone") or "").strip(), (d.get("pin") or "").strip()
     if not phone or not pin:
         return jsonify(error="Numero et PIN requis"), 400
+    s = {"lock": threading.Lock(), "loop": asyncio.new_event_loop(), "exp": time.time() + SESSION_TTL}
     try:
-        tr = _new_api(phone, pin, d.get("locale", "fr"))
-        _maybe(_method(tr, ["inititate_weblogin", "initiate_weblogin"])())
+        s["tr"] = TradeRepublicApi(phone_no=phone, pin=pin, locale=d.get("locale", "fr"))
+        _maybe(s, _method(s["tr"], ["inititate_weblogin", "initiate_weblogin"])())
     except Exception as e:
-        return jsonify(error="Connexion refusee : %s" % e), 401
+        return jsonify(error="Connexion refusee : %s" % (e or type(e).__name__)), 401
     token = uuid.uuid4().hex
-    with _lock:
-        SESSIONS[token] = {"tr": tr, "exp": time.time() + SESSION_TTL}
+    with _glock:
+        SESSIONS[token] = s
     return jsonify(session=token)
 
 
@@ -212,9 +207,9 @@ def login_verify():
     if not s:
         return jsonify(error="Session expiree"), 440
     try:
-        _maybe(_method(s["tr"], ["complete_weblogin"])((d.get("code") or "").strip()))
+        _maybe(s, _method(s["tr"], ["complete_weblogin"])((d.get("code") or "").strip()))
     except Exception as e:
-        return jsonify(error="Code refuse : %s" % e), 401
+        return jsonify(error="Code refuse : %s" % (e or type(e).__name__)), 401
     s["exp"] = time.time() + SESSION_TTL
     return jsonify(ok=True)
 
@@ -225,7 +220,7 @@ def portfolio():
     if not s:
         return jsonify(error="Session expiree"), 440
     try:
-        data = fetch_portfolio(s["tr"])
+        data = fetch_portfolio(s)
     except Exception as e:
         return jsonify(error="Lecture impossible : %s" % e), 502
     s["exp"] = time.time() + SESSION_TTL
@@ -240,7 +235,7 @@ def raw():
     out = {}
     for n in ("compact_portfolio", "portfolio", "cash"):
         try:
-            out[n] = _topic(s["tr"], [n])
+            out[n] = _topic(s, [n])
         except Exception as e:
             out[n] = "ERR: %s" % e
     return jsonify(**out)
@@ -255,9 +250,9 @@ def logout():
 
 @app.get("/")
 def health():
-    return jsonify(service="meridian-tr", status="ok", version=3, sessions=len(SESSIONS))
+    return jsonify(service="meridian-tr", status="ok", version=4, sessions=len(SESSIONS))
 
 
 if __name__ == "__main__":
-    print("Meridian — backend Trade Republic (v3) sur http://localhost:8765")
+    print("Meridian — backend Trade Republic (v4) sur http://localhost:8765")
     app.run(host="0.0.0.0", port=8765, threaded=True)
